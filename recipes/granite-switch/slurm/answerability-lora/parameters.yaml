@@ -1,0 +1,49 @@
+# Parameters for build.yaml (gb build start -f build.yaml --param-file parameters.yaml).
+# Override any of these with --param KEY=VALUE.
+
+# Names the build, the adapter dir and the ClearML task. Use a new value per
+# run: a re-run with the same RUN_ID replaces that run's adapter.
+RUN_ID: "it1-r1"
+
+ENVIRONMENT_URI: "space://environments/skypilot/slurm/ibm-bluevela"
+
+# ── Model ────────────────────────────────────────────────────────────────────
+# Public, ungated, ~17.6 GB of safetensors (no onnx). Staged by an hfpull job
+# on the cpu partition into /proj/data-eng/llmb-read-write/hfcache/. If that
+# job fails, point this at an existing copy instead:
+#   BASE_MODEL_URI: "env:///proj/<...>/granite-4.2-8b"
+BASE_MODEL_URI: "hf:///ibm-granite/granite-4.2-8b"
+# Written into adapter_config.json as base_model_name_or_path.
+BASE_MODEL_ID: "ibm-granite/granite-4.2-8b"
+
+# ── Data ─────────────────────────────────────────────────────────────────────
+# The dir produced by convert_answerability_parquet.py from intrinsics_training
+# data/train/answerability/parquet_granite4.2_8b, copied onto BlueVela. See
+# README.md, "Before the first run".
+DATASET_URI: "env:///proj/data-eng/llmb-read-write/touma/data/answerability/granite-4.2-8b-prompt-completion"
+# load_dataset split spec; slicing works ("train[:256]" for a smoke run).
+DATASET_SPLIT: "train"
+
+# ── Output ───────────────────────────────────────────────────────────────────
+# Adapters land in $ADAPTER_ROOT/$RUN_ID on shared /proj (container-visible).
+ADAPTER_ROOT: "/proj/data-eng/llmb-read-write/touma/adapters/answerability-lora"
+
+# ── Compute ──────────────────────────────────────────────────────────────────
+# 4x H200, DDP: one bf16 copy of the 8B base per GPU, as the source config's
+# gpus_per_node: 4. Effective batch = 4 GPUs x 1 x 8 accumulation = 32.
+ACCELERATORS: "H200:4"
+MEMORY: "512"
+
+# ── Schedule ─────────────────────────────────────────────────────────────────
+NUM_TRAIN_EPOCHS: 3
+# -1 = run all epochs; a positive value caps the run (smoke tests).
+MAX_STEPS: -1
+
+# ── Tracking ─────────────────────────────────────────────────────────────────
+# true: track in ClearML. Needs space secrets CLEARML_API_HOST,
+# CLEARML_API_ACCESS_KEY and CLEARML_API_SECRET_KEY; the build declares them
+# so they reach the step env. false: no tracking (loss is still in the step log).
+CLEARML: false
+CLEARML_PROJECT: "granite-switch/answerability"
+
+POLL_INTERVAL_SECONDS: 120
