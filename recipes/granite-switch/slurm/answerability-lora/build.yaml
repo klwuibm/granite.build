@@ -2,14 +2,19 @@
 # Answerability LoRA adapter on granite-4.2-8b, trained with the hf-peft-sft
 # step on IBM BlueVela over SLURM.
 #
-# ONE target. The step stages the base model (hfpull), binds the converted
-# answerability dataset already on /proj (env://, no transfer), trains a LoRA
-# adapter with TRL's SFTTrainer on its prompt/completion columns (loss on the
-# completion only), and registers the ADAPTER as the `adapter` artifact.
+# Two targets, wired by one artifact:
 #
-# Hyperparameters mirror intrinsics_training's
-# configs/answerability/granite_4.2_8b_lora_trl.yaml. See README.md for the
-# data preparation this build expects, and what differs from that config.
+#   prepare ──(dataset)──> train
+#
+# `prepare` pulls the answerability parquet from the private HF dataset repo
+# ibm-research/touma (only that directory: the hf:// URI names a path in the
+# repo), keeps its prompt/completion columns, and writes them to shared /proj.
+# `train` stages the base model (hfpull), binds that dataset, trains a LoRA
+# adapter with TRL's SFTTrainer (loss on the completion only), and registers
+# the ADAPTER as the `adapter` artifact.
+#
+# See README.md for the HF_TOKEN secret this needs and why the conversion
+# exists.
 #
 #   gb build start -f build.yaml --param-file parameters.yaml
 #   gb build start -f build.yaml --param-file parameters.yaml --param RUN_ID=r2
@@ -19,18 +24,151 @@ granite.build:
 
   targets:
 
+    ##########################################################################
+    # prepare — HF parquet -> prompt/completion dataset on /proj (CPU only)
+    ##########################################################################
+    prepare:
+      environment_uri: "$${ENVIRONMENT_URI}"
+      inputs:
+        # Only training_data/answerability/parquet_granite4.2_8b is downloaded,
+        # into the shared hf cache, and bound at that directory.
+        source:
+          uri: "$${SOURCE_DATA_URI}"
+          type: dataset
+      outputs:
+        # Shared /proj, so train (another SLURM job) can read it.
+        dataset:
+          uri: "env://$${DATA_ROOT}/$${RUN_ID}"
+          type: dataset
+      steps:
+        - step_uri: space://steps/command
+          config:
+            poll_interval_seconds: $${POLL_INTERVAL_SECONDS}
+            # CPU-only: the cpu partition, without the environment-wide H200
+            # constraint (as the environment does for hfpull/hfpush).
+            zone: cpu
+            launcher_config:
+              resources:
+                memory: "$${PREP_MEMORY}"
+              sbatch_options:
+                constraint: null
+            command_config:
+              # The hf-peft-sft image: its venv has the pinned pyarrow, and
+              # train pulls the same image, so the node cache serves both.
+              image: "$${PREP_IMAGE}"
+              # TRL treats a dataset with `input_ids` as already tokenized and
+              # skips its chat-template tokenization and completion-only
+              # masking, so keep exactly `prompt` and `completion`. The script
+              # must contain no Jinja delimiters: the step renders it.
+              command: |
+                set -euo pipefail
+                SRC="{{ bindings.source.binding.path }}"
+                OUT="$${DATA_ROOT}/$${RUN_ID}"
+                PY=/opt/hf-peft-sft/.venv/bin/python
+                echo "prepare: $SRC -> $OUT"
+                mkdir -p "$OUT"
+                "$PY" -I - "$SRC" "$OUT" "$${SOURCE_DATA_URI}" <<'PY'
+                import hashlib
+                import json
+                import sys
+                from pathlib import Path
+
+                import pyarrow.parquet as pq
+
+                KEEP = ["prompt", "completion"]
+                SPLITS = ["train", "test"]
+                # Above this share of dropped rows the data is wrong, not noisy.
+                MAX_DROPPED = 0.01
+
+
+                def sha256(path):
+                    h = hashlib.sha256()
+                    with path.open("rb") as f:
+                        for chunk in iter(lambda: f.read(1 << 20), b""):
+                            h.update(chunk)
+                    return h.hexdigest()
+
+
+                def bad_rows(table, split):
+                    """Rows to drop: the completion must answer a user turn.
+
+                    A row whose prompt is not a message list, or whose
+                    completion is not one assistant message, fails the run:
+                    that is a schema problem, not a stray row.
+                    """
+                    prompts = table.column("prompt").to_pylist()
+                    completions = table.column("completion").to_pylist()
+                    bad = []
+                    for i, (p, c) in enumerate(zip(prompts, completions)):
+                        where = f"{split} row {i}"
+                        if not p or not all(isinstance(m, dict) and "role" in m for m in p):
+                            sys.exit(f"prepare: {where}: prompt is not a non-empty message list")
+                        if len(c) != 1 or c[0]["role"] != "assistant":
+                            sys.exit(f"prepare: {where}: completion is not one assistant message")
+                        if p[-1]["role"] != "user":
+                            bad.append((i, p[-1]["role"]))
+                    return bad
+
+
+                src, out, source_uri = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
+                (out / "data").mkdir(parents=True, exist_ok=True)
+                report = dict()
+                for split in SPLITS:
+                    f = src / f"{split}.parquet"
+                    if not f.is_file():
+                        sys.exit(f"prepare: {f} not found; SOURCE_DATA_URI must name the parquet dir")
+                    table = pq.read_table(f)
+                    missing = [c for c in KEEP if c not in table.column_names]
+                    if missing:
+                        sys.exit(f"prepare: {f}: missing columns {missing}; has {table.column_names}")
+                    kept = table.select(KEEP)
+                    bad = bad_rows(kept, split)
+                    if bad:
+                        print(f"prepare: {split}: dropping {len(bad)} row(s) whose prompt "
+                              f"does not end in a user turn: {bad[:20]}", flush=True)
+                        if len(bad) > MAX_DROPPED * kept.num_rows:
+                            sys.exit(f"prepare: {split}: {len(bad)} of {kept.num_rows} rows "
+                                     f"have a prompt not ending in a user turn (over {MAX_DROPPED:.0%})")
+                        drop = set(i for i, _ in bad)
+                        kept = kept.take([i for i in range(kept.num_rows) if i not in drop])
+                    pq.write_table(kept, out / "data" / f"{split}.parquet", compression="zstd")
+                    counts = dict()
+                    for c in kept.column("completion").to_pylist():
+                        counts[c[0]["content"]] = counts.get(c[0]["content"], 0) + 1
+                    report[split] = dict(
+                        source_sha256=sha256(f),
+                        source_columns=table.column_names,
+                        source_rows=table.num_rows,
+                        dropped_rows=[dict(row=i, last_prompt_role=r) for i, r in bad],
+                        rows=kept.num_rows,
+                        completion_counts=counts,
+                    )
+                    print("prepare:", split, json.dumps(report[split]), flush=True)
+                (out / "README.md").write_text(
+                    "# answerability prompt/completion (granite-4.2-8b)\n\n"
+                    f"Converted from `{source_uri}` by keeping only the `prompt` and "
+                    "`completion` columns (dropping the pre-tokenized `input_ids` / "
+                    "`labels` / `attention_mask`), and dropping rows whose prompt "
+                    "does not end in a user turn (`dropped_rows`, by source row).\n\n"
+                    "```json\n" + json.dumps(report, indent=2) + "\n```\n"
+                )
+                PY
+                echo "GB_ARTIFACT_ID:dataset GB_ARTIFACT_PATH:$OUT"
+
+    ##########################################################################
+    # train — LoRA adapter with hf-peft-sft (DDP on H200)
+    ##########################################################################
     train:
       environment_uri: "$${ENVIRONMENT_URI}"
       inputs:
         base_model:
           uri: "$${BASE_MODEL_URI}"
           type: model
-        # The converted dir (data/train.parquet + data/test.parquet). It must
-        # already be on BlueVela, under the container-visible
-        # /proj/data-eng/llmb-read-write tree; env:// transfers nothing.
+        # The prompt/completion dir prepare wrote (data/train.parquet +
+        # data/test.parquet). Binding it sequences the targets and records the
+        # lineage edge from the HF source to the adapter.
         dataset:
-          uri: "$${DATASET_URI}"
-          type: dataset
+          binding: prepare.dataset
       outputs:
         # Written to shared /proj so it survives teardown; must match
         # hf_peft_sft_config.output_path below.

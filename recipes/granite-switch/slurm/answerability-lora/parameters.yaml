@@ -17,10 +17,15 @@ BASE_MODEL_URI: "hf:///ibm-granite/granite-4.2-8b"
 BASE_MODEL_ID: "ibm-granite/granite-4.2-8b"
 
 # ── Data ─────────────────────────────────────────────────────────────────────
-# The dir produced by convert_answerability_parquet.py from intrinsics_training
-# data/train/answerability/parquet_granite4.2_8b, copied onto BlueVela. See
-# README.md, "Before the first run".
-DATASET_URI: "env:///proj/data-eng/llmb-read-write/touma/data/answerability/granite-4.2-8b-prompt-completion"
+# The answerability parquet in the private HF dataset repo ibm-research/touma.
+# The path after the revision limits the pull to that directory; the prepare
+# target keeps its prompt/completion columns. Needs an HF_TOKEN secret with
+# read access to ibm-research (README.md). Replace `main` with a commit hash
+# to pin the data.
+SOURCE_DATA_URI: "hf:///datasets/ibm-research/touma/main/training_data/answerability/parquet_granite4.2_8b"
+# prepare writes the converted dataset to $DATA_ROOT/$RUN_ID on shared /proj
+# (container-visible), where train reads it.
+DATA_ROOT: "/proj/data-eng/llmb-read-write/touma/data/answerability-lora"
 # load_dataset split spec; slicing works ("train[:256]" for a smoke run).
 DATASET_SPLIT: "train"
 
@@ -29,10 +34,14 @@ DATASET_SPLIT: "train"
 ADAPTER_ROOT: "/proj/data-eng/llmb-read-write/touma/adapters/answerability-lora"
 
 # ── Compute ──────────────────────────────────────────────────────────────────
-# 4x H200, DDP: one bf16 copy of the 8B base per GPU, as the source config's
-# gpus_per_node: 4. Effective batch = 4 GPUs x 1 x 8 accumulation = 32.
+# 4x H200, DDP: one bf16 copy of the 8B base per GPU.
+# Effective batch = 4 GPUs x 1 x 8 accumulation = 32.
 ACCELERATORS: "H200:4"
 MEMORY: "512"
+# prepare runs on the cpu partition in the hf-peft-sft image (its venv has
+# pyarrow). Host GiB for that job.
+PREP_IMAGE: "quay.io/granitebuild/steps/train/hf-peft-sft/skypilot:peft-v0.21.2-4"
+PREP_MEMORY: "32"
 
 # ── Schedule ─────────────────────────────────────────────────────────────────
 NUM_TRAIN_EPOCHS: 3

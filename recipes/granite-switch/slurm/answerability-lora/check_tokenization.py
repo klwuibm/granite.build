@@ -1,16 +1,22 @@
-"""Check that the converted prompt/completion data tokenizes to what was trained.
+"""Check that the prepared prompt/completion data tokenizes to what was trained.
 
-The source parquet carries the `input_ids` / `labels` intrinsics_training's
-transform produced. hf-peft-sft re-tokenizes the converted `prompt` /
-`completion` columns with TRL's prompt-completion path instead. This replays
-that path (the same steps as trl 1.17.1 SFTTrainer's tokenize_fn: chat template
-on the prompt with add_generation_prompt, on prompt + completion without, the
-completion starting where the two diverge) on a sample of rows and compares
-them with the stored columns.
+The source parquet (training_data/answerability/parquet_granite4.2_8b in the HF
+dataset repo ibm-research/touma) carries pre-tokenized `input_ids` / `labels`
+next to the `prompt` / `completion` they were tokenized from. The prepare
+target keeps only `prompt` / `completion`, and hf-peft-sft re-tokenizes them
+with TRL's prompt-completion path. This replays that path (the same steps as
+trl 1.17.1 SFTTrainer's tokenize_fn: chat template on the prompt with
+add_generation_prompt, on prompt + completion without, the completion starting
+where the two diverge) on a sample of rows and compares them with the stored
+columns.
 
     python -I check_tokenization.py <tokenizer dir or HF id> <source parquet> [N]
 
-Needs transformers + jinja2 + pyarrow (CPU only; no model weights).
+Needs transformers + jinja2 + pyarrow (CPU only; no model weights). Get the
+source parquet with:
+
+    hf download ibm-research/touma --repo-type dataset \
+      --include 'training_data/answerability/parquet_granite4.2_8b/*' --local-dir .
 """
 
 import sys

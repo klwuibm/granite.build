@@ -18,11 +18,11 @@
 
 The recipe is rendered with its parameters and then through hf-peft-sft's own
 step-template blocks with the strict renderer, so a config error that would fail
-the build at step creation fails here instead. The converter is run on a small
-parquet with the schema intrinsics_training's transform_data.py writes.
+the build at step creation fails here instead. The prepare target's command is
+rendered the way the command step renders it and run on a small parquet with
+the schema of the HF source (pre-tokenized columns next to prompt/completion).
 """
 
-import importlib.util
 import pathlib
 import subprocess
 
@@ -57,6 +57,10 @@ def _build(tmp_path, *params):
 
 def _target(tmp_path, *params):
     return _build(tmp_path, *params)["targets"]["train"]
+
+
+def _prepare(tmp_path, *params):
+    return _build(tmp_path, *params)["targets"]["prepare"]
 
 
 def _step_config(target):
@@ -107,11 +111,35 @@ def test_environment_is_bluevela_slurm(tmp_path):
     assert isinstance(resources["memory"], str)
 
 
-def test_regular_lora_with_a_bound_dataset(tmp_path):
-    cfg = _step_config(_target(tmp_path))["hf_peft_sft_config"]
+def test_regular_lora_with_the_prepared_dataset(tmp_path):
+    target = _target(tmp_path)
+    cfg = _step_config(target)["hf_peft_sft_config"]
     assert cfg["method"] == "lora"
     assert "dataset_name" not in cfg
-    assert _target(tmp_path)["inputs"]["dataset"]["uri"].startswith("env:///proj/")
+    assert target["inputs"]["dataset"] == {"binding": "prepare.dataset"}
+
+
+def test_prepare_pulls_only_the_parquet_dir_from_hf(tmp_path):
+    from gbcommon.uri.hf import HfType, HfURI
+
+    source = _prepare(tmp_path)["inputs"]["source"]
+    assert source["type"] == "dataset"
+    uri = HfURI.parse(source["uri"])
+    assert uri.get_hf_type() == HfType.DATASET
+    assert f"{uri.get_owner()}/{uri.get_repo()}" == "ibm-research/touma"
+    assert uri.get_path_in_repo() == "training_data/answerability/parquet_granite4.2_8b"
+
+
+def test_prepare_writes_to_shared_storage_on_the_cpu_partition(tmp_path):
+    prepare = _prepare(tmp_path, "RUN_ID=abc")
+    out = prepare["outputs"]["dataset"]
+    assert out["uri"].startswith("env:///proj/data-eng/llmb-read-write/")
+    assert out["uri"].endswith("/abc")
+    (step,) = prepare["steps"]
+    assert step["step_uri"] == "space://steps/command"
+    assert step["config"]["zone"] == "cpu"
+    assert step["config"]["launcher_config"]["sbatch_options"] == {"constraint": None}
+    assert "accelerators" not in step["config"]["launcher_config"]["resources"]
 
 
 def test_output_path_matches_the_output_uri(tmp_path):
@@ -123,7 +151,7 @@ def test_output_path_matches_the_output_uri(tmp_path):
 
 
 def test_hyperparameters_mirror_the_source_config(tmp_path):
-    """intrinsics_training configs/answerability/granite_4.2_8b_lora_trl.yaml."""
+    """The answerability LoRA recipe: r16/a32, lr 5e-5 cosine, batch 32."""
     argv = _run_argv(_target(tmp_path))
     flags = _flags(argv)
     assert argv[argv.index("--method") + 1] == "lora"
@@ -178,25 +206,33 @@ def test_smoke_overrides_render(tmp_path):
     assert flags["--max_steps"] == "4"
 
 
-# ── converter ────────────────────────────────────────────────────────────────
+# ── prepare ──────────────────────────────────────────────────────────────────
 
 
-def _converter():
-    spec = importlib.util.spec_from_file_location(
-        "convert_answerability_parquet",
-        _RECIPE / "convert_answerability_parquet.py",
+def _prepare_script(tmp_path, src, out_root, *params):
+    """prepare's command, rendered as the command step renders it, with the
+    hf-peft-sft image's venv python swapped for this interpreter."""
+    import sys
+
+    step = _prepare(tmp_path, f"DATA_ROOT={out_root}", *params)["steps"][0]
+    command = fill_template(
+        step["config"]["command_config"]["command"],
+        {"bindings": {"source": {"binding": {"path": str(src)}}}},
+        strict=True,
     )
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
+    return command.replace("/opt/hf-peft-sft/.venv/bin/python", sys.executable)
 
 
-def _transform_table(n, prompt_end="user"):
-    """The columns transform_data.py's make_record_table writes."""
+def _source_table(n, bad=()):
+    """The HF source's columns: pre-tokenized ids next to prompt/completion.
+
+    Rows in *bad* end their prompt with an `agent` turn, as 6 rows of the real
+    train split do.
+    """
     prompts = [
         [
             {"role": "user", "content": "You have access to the following documents:"},
-            {"role": prompt_end, "content": f"q{i}?"},
+            {"role": "agent" if i in bad else "user", "content": f"q{i}?"},
         ]
         for i in range(n)
     ]
@@ -221,46 +257,66 @@ def _transform_table(n, prompt_end="user"):
     )
 
 
-def _write_src(tmp_path, **kw):
+def _write_src(tmp_path, train_rows=6, bad=()):
     src = tmp_path / "src"
     src.mkdir()
-    pq.write_table(_transform_table(6, **kw), src / "train.parquet")
-    pq.write_table(_transform_table(2, **kw), src / "test.parquet")
+    pq.write_table(_source_table(train_rows, bad), src / "train.parquet")
+    pq.write_table(_source_table(2), src / "test.parquet")
     return src
 
 
-def test_converter_keeps_only_prompt_and_completion(tmp_path):
-    out = tmp_path / "out"
-    _converter().main(_write_src(tmp_path), out)
+def _run_prepare(tmp_path, src):
+    script = _prepare_script(tmp_path, src, tmp_path / "data", "RUN_ID=r1")
+    return subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+
+
+def test_prepare_keeps_only_prompt_and_completion(tmp_path):
+    proc = _run_prepare(tmp_path, _write_src(tmp_path))
+    assert proc.returncode == 0, proc.stderr
+    out = tmp_path / "data" / "r1"
     for split, rows in (("train", 6), ("test", 2)):
         table = pq.read_table(out / "data" / f"{split}.parquet")
         # No input_ids: TRL would take the data as pre-tokenized and skip its
         # chat-template tokenization and completion-only masking.
         assert table.column_names == ["prompt", "completion"]
         assert table.num_rows == rows
-    assert "source_sha256" in (out / "README.md").read_text()
+    readme = (out / "README.md").read_text()
+    assert "source_sha256" in readme
+    assert "hf:///datasets/ibm-research/touma/main/" in readme
+    assert f"GB_ARTIFACT_ID:dataset GB_ARTIFACT_PATH:{out}" in proc.stdout
 
 
-def test_converter_output_matches_the_trl_prompt_completion_format(tmp_path):
+def test_prepare_output_matches_the_trl_prompt_completion_format(tmp_path):
     hf_train = pytest.importorskip("hf_peft_sft_train", reason="needs step src on path")
-    out = tmp_path / "out"
-    _converter().main(_write_src(tmp_path), out)
-    cols = pq.read_table(out / "data" / "train.parquet").column_names
+    assert _run_prepare(tmp_path, _write_src(tmp_path)).returncode == 0
+    cols = pq.read_table(
+        tmp_path / "data" / "r1" / "data" / "train.parquet"
+    ).column_names
     assert hf_train.detect_format(cols) == "prompt_completion"
 
 
-def test_converter_refuses_an_lfs_pointer(tmp_path):
-    src = tmp_path / "src"
-    src.mkdir()
-    (src / "train.parquet").write_text(
-        "version https://git-lfs.github.com/spec/v1\noid sha256:x\nsize 1\n"
-    )
-    with pytest.raises(SystemExit, match="LFS pointer"):
-        _converter().main(src, tmp_path / "out")
+def test_prepare_fails_without_the_parquet(tmp_path):
+    (tmp_path / "src").mkdir()
+    proc = _run_prepare(tmp_path, tmp_path / "src")
+    assert proc.returncode != 0
+    assert "train.parquet not found" in proc.stderr
+    assert "GB_ARTIFACT_ID" not in proc.stdout
 
 
-def test_converter_refuses_a_prompt_not_ending_in_a_user_turn(tmp_path):
-    with pytest.raises(ValueError, match="prompt ends with role 'assistant'"):
-        _converter().main(
-            _write_src(tmp_path, prompt_end="assistant"), tmp_path / "out"
-        )
+def test_prepare_drops_and_records_a_prompt_not_ending_in_a_user_turn(tmp_path):
+    proc = _run_prepare(tmp_path, _write_src(tmp_path, train_rows=200, bad={7}))
+    assert proc.returncode == 0, proc.stderr
+    assert "train: dropping 1 row(s)" in proc.stdout
+    out = tmp_path / "data" / "r1"
+    table = pq.read_table(out / "data" / "train.parquet")
+    assert table.num_rows == 199
+    assert "q7?" not in str(table.column("prompt").to_pylist())
+    readme = (out / "README.md").read_text()
+    assert '"row": 7' in readme and '"last_prompt_role": "agent"' in readme
+
+
+def test_prepare_fails_when_too_many_rows_are_bad(tmp_path):
+    proc = _run_prepare(tmp_path, _write_src(tmp_path, train_rows=50, bad={1, 2}))
+    assert proc.returncode != 0
+    assert "2 of 50 rows" in proc.stderr
+    assert "GB_ARTIFACT_ID" not in proc.stdout
