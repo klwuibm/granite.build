@@ -37,9 +37,11 @@ MAX_LENGTH: 8192
 # ── Method ───────────────────────────────────────────────────────────────────
 # lora: a regular LoRA adapter. alora: an activated LoRA (README, "aLoRA").
 METHOD: "lora"
-# Only for METHOD=alora. Granite 4.2's ChatML assistant marker, as in the
-# 4.2 aLoRA configs; the trailing newline is part of it.
-ALORA_INVOCATION_STRING: "<|im_start|>assistant\n"
+# Only for METHOD=alora. Granite 4.2's ChatML assistant marker, without the
+# trailing newline the 4.2 QR/QC aLoRA configs have: gbserver's template fill
+# drops a value's trailing newline, so that form cannot reach the trainer
+# today (README, "aLoRA"). Tokens [100256, 78191].
+ALORA_INVOCATION_STRING: "<|im_start|>assistant"
 LORA_R: 16
 LORA_ALPHA: 32
 LEARNING_RATE: 5.0e-05

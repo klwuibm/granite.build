@@ -271,7 +271,7 @@ granite.build:
               # The ChatML assistant marker Granite 4.2 emits before the answer
               # turn; the last occurrence in each row opens the trained span.
               # tojson: a JSON string is a valid YAML double-quoted scalar, so
-              # the trailing newline survives as \n instead of folding to a space.
+              # any special character in the value survives parameter rendering.
               alora_invocation_string: $${ALORA_INVOCATION_STRING | tojson}
 <% endif %>
               distributed: ddp

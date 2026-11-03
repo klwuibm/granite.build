@@ -132,18 +132,28 @@ gb build start -f build.yaml --param-file parameters.yaml \
   --param ADAPTER_ROOT=/proj/data-eng/llmb-read-write/touma/adapters/answerability-alora
 ```
 
-- **Invocation: `<|im_start|>assistant\n`**, Granite 4.2's ChatML assistant
-  marker with its newline (tokens `[100256, 78191, 198]`). It is the 4.2 form
-  of the `<|start_of_role|>assistant<|end_of_role|>` marker used for the 4.0 /
-  4.1 answerability aLoRA adapters, and the string the Granite 4.2 query
-  rewrite and query clarification aLoRA adapters use. The 4.1 string does not
-  work on 4.2: 4.2 has no `<|start_of_role|>` token, so it becomes 19 plain
-  text tokens that occur in no row. Checked on 300 converted rows, the last
-  occurrence of the 4.2 invocation in every row opens the answer turn
+- **Invocation: `<|im_start|>assistant`**, Granite 4.2's ChatML assistant
+  marker (tokens `[100256, 78191]`). It is the 4.2 form of the
+  `<|start_of_role|>assistant<|end_of_role|>` marker used for the 4.0 / 4.1
+  answerability aLoRA adapters. The 4.1 string does not work on 4.2: 4.2 has
+  no `<|start_of_role|>` token, so it becomes 19 plain text tokens that occur
+  in no row. On all 11,990 prepared train rows, the last occurrence of the
+  4.2 invocation opens the answer turn
   (`…<|im_start|>assistant\n<think></think>"answerable"<|im_end|>`), which is
   where peft activates the adapter. The step re-checks the first 32 tokenized
   rows and fails before training if the invocation is missing from all of
   them.
+- **Why not `<|im_start|>assistant\n`.** The Granite 4.2 query rewrite and
+  query clarification aLoRA adapters use the marker with its newline (tokens
+  `[100256, 78191, 198]`), and it fits this data equally well. But gbserver
+  renders every step config string as a Jinja template, and Jinja drops one
+  trailing newline, so a value ending in `\n` reaches the trainer without it.
+  The aLoRA smoke run (build `911ee612`) asked for the newline and trained
+  with `[100256, 78191]`. Until gbserver keeps trailing newlines
+  (`keep_trailing_newline` in `src/gbserver/utils/template.py`, a change to
+  every build, so out of scope here), the default is the form that actually
+  arrives. The adapter then activates one token earlier than the QR/QC
+  adapters, on the newline before `<think></think>`.
 - **`gradient_checkpointing` is off for aLoRA.** Recomputing activations loses
   peft's aLoRA offsets and zeroes the gradients (peft issue #2826), so the
   build turns it off whenever `METHOD=alora`. That uses more GPU memory per
@@ -164,7 +174,7 @@ gb build start -f build.yaml --param-file parameters.yaml \
 | `DATASET_SPLIT` | `train` | `load_dataset` split; `train[:256]` for a smoke run. |
 | `MAX_LENGTH` | `8192` | Tokens per row: `prepare` drops longer rows, and `train` uses it as `max_length`. |
 | `METHOD` | `lora` | `lora` or `alora`. Also names the build and the ClearML task. |
-| `ALORA_INVOCATION_STRING` | `<\|im_start\|>assistant\n` | Only for `METHOD=alora`. |
+| `ALORA_INVOCATION_STRING` | `<\|im_start\|>assistant` | Only for `METHOD=alora`. A trailing newline would be dropped (see [aLoRA](#alora)). |
 | `LORA_R` / `LORA_ALPHA` / `LEARNING_RATE` | `16` / `32` / `5e-5` | Adapter rank, scale and learning rate. |
 | `ADAPTER_ROOT` | `/proj/data-eng/llmb-read-write/touma/adapters/answerability-lora` | Shared, so the adapter survives teardown. Use another one (or another `RUN_ID`) for aLoRA, so the two don't collide. |
 | `ACCELERATORS` | `H200:4` | DDP over 4 GPUs. Effective batch 4 × 1 × 8 = 32. |
@@ -193,3 +203,41 @@ gb build start -f build.yaml --param-file parameters.yaml \
   `MAX_LENGTH`, so `max_length` never cuts a row.
 - **`use_reentrant` is set by the step** (`false` for LoRA + DDP), and
   `mixed_precision: bf16` is how this step asks for bf16.
+
+## Findings from iteration 1
+
+Runs on IBM BlueVela (SLURM), branch `answerability-adapter-hf-peft-sft-2`,
+gbserver standalone. Training loss here is only a plumbing check: the
+completion is one label plus `</think>` and `<|im_end|>`, so loss falls to
+near zero quickly and says nothing about held-out accuracy. No evaluation has
+been run yet.
+
+| Build | What | Result |
+|---|---|---|
+| `d6c10b3f` (smoke1) | LoRA, 1×H200, `train[:64]`, 4 steps | Path-limited HF pull OK (`hf download … --include <dir> --include <dir>/*`, 2 files). `prepare` never started: cpu partition memory cap (below). Cancelled. |
+| `0f88a0f5` (smoke2) | LoRA, same | SUCCESS. 4 steps in 19.8 s, adapter registered. |
+| `a255acdc` (it1-r1) | LoRA, 4×H200 DDP, full data, 3 epochs | Training completed (1,125 steps, 5,935 s, final loss ≈0.0015, mean 0.0866), adapter at `.../adapters/answerability-lora/it1-r1`. Build marked FAILED by gbserver (below); adapter not registered. |
+| `911ee612` (asmoke1) | aLoRA, 1×H200, longest-row slice `train[11069:11133]`, 4 steps, no gradient checkpointing | SUCCESS. Rows up to 8,136 tokens fit without checkpointing; all 280 `lora_B` matrices nonzero (no #2826 zero gradients). Invocation stored as `[100256, 78191]`, not the requested `\n` form (below). |
+
+What these runs found:
+
+- **The cpu partition caps memory at 8 GiB per CPU.** Asking for more memory
+  than 8 × CPUs makes SLURM raise cpus-per-task past SkyPilot's `srun --cpus`,
+  and every job aborts at container start (`srun: fatal: cpus-per-task set by
+  two different environment variables`). SkyPilot reports only "Failed to
+  acquire resources" and retries. Fixed: `prepare` asks for 2 CPUs and 16 GiB.
+- **853 train / 76 test rows exceed 8,192 tokens.** TRL keeps a row's start,
+  so their label was cut and TRL dropped them silently: it1-r1 trained on
+  11,990 rows, not 12,843. Fixed: `prepare` drops and records them, so the
+  data a run trains on is stated, and LoRA and aLoRA runs see the same rows.
+- **gbserver failed a running job when DNS dropped.** The laptop running
+  gbserver lost DNS for the login nodes for ~24 min; the status checks failed,
+  the retry handler treated that as a job failure, and gbserver marked the
+  build FAILED and dropped the cluster while training kept running. The SLURM
+  job then held its 4 H200s, idle, until cancelled by hand, and the two
+  post-build cleanup VMs failed, orphaning
+  `/proj/.../builds/builds/a255acdc-.../runs/*`. Not fixed here: run gbserver
+  from a host with stable access to the login nodes, and check `squeue` after
+  a FAILED build.
+- **gbserver drops a trailing newline from config strings** (see
+  [aLoRA](#alora)). Not fixed here; the aLoRA default avoids it.

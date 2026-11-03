@@ -33,7 +33,7 @@ import yaml
 
 from gbcli.services.service_build import get_params_from_file
 from gbcli.utils.buildutil import apply_parameters
-from gbserver.utils.template import fill_template
+from gbserver.utils.template import fill_objtemplate, fill_template
 
 _REPO = pathlib.Path(__file__).resolve().parents[3]
 _RECIPE = _REPO / "recipes" / "granite-switch" / "slurm" / "answerability-lora"
@@ -45,11 +45,14 @@ _LAUNCHER = _TEMPLATE["environment_configs"]["Skypilot"]["launchers"]["hf_peft_s
 _SCRIPTS = ("hf_peft_sft_guard.sh", "hf_peft_sft_setup.sh", "hf_peft_sft_run.sh")
 
 
-def _build(tmp_path, *params):
+def _build(tmp_path, *params, overrides=None):
+    """The recipe rendered with parameters.yaml, --param style *params*, and
+    *overrides* merged into the file values (for values --param can't carry)."""
+    file_params = get_params_from_file(str(_RECIPE / "parameters.yaml"))
     text = apply_parameters(
         (_RECIPE / "build.yaml").read_text(),
         list(params),
-        get_params_from_file(str(_RECIPE / "parameters.yaml")),
+        {**file_params, **(overrides or {})},
         str(tmp_path),
     )
     return yaml.safe_load(text)["granite.build"]
@@ -70,8 +73,13 @@ def _step_config(target):
 
 
 def _run_argv(target):
-    """The trainer argv the step's run block hands hf_peft_sft_run.sh."""
-    config = _step_config(target)
+    """The trainer argv the step's run block hands hf_peft_sft_run.sh.
+
+    The step config first goes through fill_objtemplate, as gbserver's target
+    step run does: it renders every string value as a template, which is
+    where a value's trailing newline is lost.
+    """
+    config = fill_objtemplate(_step_config(target), {}, strict=False)
     cfg = {**_TEMPLATE["config"]["hf_peft_sft_config"], **config["hf_peft_sft_config"]}
     cfg["image_id"] = "docker:quay.io/x/img:t"
     ctx = {
@@ -424,16 +432,29 @@ def test_lora_by_default_with_gradient_checkpointing(tmp_path):
     assert _flags(argv)["--gradient_checkpointing"] == "true"
 
 
-def test_alora_invocation_reaches_the_trainer_with_its_newline(tmp_path):
+def test_alora_invocation_reaches_the_trainer(tmp_path):
     target = _target(tmp_path, "METHOD=alora")
     cfg = _step_config(target)["hf_peft_sft_config"]
     assert cfg["method"] == "alora"
-    assert cfg["alora_invocation_string"] == "<|im_start|>assistant\n"
+    assert cfg["alora_invocation_string"] == "<|im_start|>assistant"
     argv = _run_argv(target)
     assert argv[argv.index("--method") + 1] == "alora"
-    assert (
-        argv[argv.index("--alora_invocation_string") + 1] == "<|im_start|>assistant\n"
-    )
+    assert argv[argv.index("--alora_invocation_string") + 1] == "<|im_start|>assistant"
+
+
+def test_a_trailing_newline_in_the_invocation_is_dropped(tmp_path):
+    """Documents the gbserver behaviour the default works around (README,
+    "aLoRA"): the build config keeps the newline, the trainer does not get it.
+    If this starts failing, gbserver keeps trailing newlines and the default
+    can follow the Granite 4.2 QR/QC adapters' "<|im_start|>assistant\\n"."""
+    # From the parameters file, as the smoke run had it: a --param value loses
+    # its trailing newline even earlier, when the CLI parses it.
+    newline = {"ALORA_INVOCATION_STRING": "<|im_start|>assistant\n"}
+    target = _build(tmp_path, "METHOD=alora", overrides=newline)["targets"]["train"]
+    cfg = _step_config(target)["hf_peft_sft_config"]
+    assert cfg["alora_invocation_string"] == "<|im_start|>assistant\n"
+    argv = _run_argv(target)
+    assert argv[argv.index("--alora_invocation_string") + 1] == "<|im_start|>assistant"
 
 
 def test_alora_turns_gradient_checkpointing_off(tmp_path):
