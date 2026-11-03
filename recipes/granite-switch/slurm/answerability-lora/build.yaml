@@ -20,7 +20,7 @@
 #   gb build start -f build.yaml --param-file parameters.yaml --param RUN_ID=r2
 #####
 granite.build:
-  name: answerability-lora-$${RUN_ID}
+  name: answerability-$${METHOD}-$${RUN_ID}
 
   targets:
 
@@ -35,6 +35,12 @@ granite.build:
         source:
           uri: "$${SOURCE_DATA_URI}"
           type: dataset
+        # The base model, for its tokenizer and chat template: prepare drops the
+        # rows TRL would truncate past their label. Same URI as train's, so the
+        # pull is shared (the cache is keyed by repo and revision).
+        base_model:
+          uri: "$${BASE_MODEL_URI}"
+          type: model
       outputs:
         # Shared /proj, so train (another SLURM job) can read it.
         dataset:
@@ -62,27 +68,36 @@ granite.build:
               image: "$${PREP_IMAGE}"
               # TRL treats a dataset with `input_ids` as already tokenized and
               # skips its chat-template tokenization and completion-only
-              # masking, so keep exactly `prompt` and `completion`. The script
-              # must contain no Jinja delimiters: the step renders it.
+              # masking, so keep exactly `prompt` and `completion`. Rows longer
+              # than MAX_LENGTH tokens are dropped here: TRL keeps the start of
+              # a row, so the label at the end would be cut off and TRL would
+              # drop the row anyway, without saying which. The script must
+              # contain no Jinja delimiters: the step renders it.
               command: |
                 set -euo pipefail
                 SRC="{{ bindings.source.binding.path }}"
+                MODEL="{{ bindings.base_model.binding.path }}"
                 OUT="$${DATA_ROOT}/$${RUN_ID}"
                 PY=/opt/hf-peft-sft/.venv/bin/python
                 echo "prepare: $SRC -> $OUT"
                 mkdir -p "$OUT"
-                "$PY" -I - "$SRC" "$OUT" "$${SOURCE_DATA_URI}" <<'PY'
+                "$PY" -I - "$SRC" "$OUT" "$${SOURCE_DATA_URI}" "$MODEL" "$${MAX_LENGTH}" <<'PY'
                 import hashlib
                 import json
                 import sys
                 from pathlib import Path
 
                 import pyarrow.parquet as pq
+                from transformers import AutoTokenizer
 
                 KEEP = ["prompt", "completion"]
                 SPLITS = ["train", "test"]
-                # Above this share of dropped rows the data is wrong, not noisy.
+                # Above this share of rows dropped for their turns, the data is
+                # wrong, not noisy.
                 MAX_DROPPED = 0.01
+                # Above this share of rows dropped as too long, MAX_LENGTH is
+                # too short for this data.
+                MAX_TOO_LONG = 0.10
 
 
                 def sha256(path):
@@ -114,7 +129,36 @@ granite.build:
                     return bad
 
 
+                def too_long(table, tok, max_length):
+                    """(row, tokens) for rows longer than max_length, as TRL counts them.
+
+                    TRL tokenizes prompt + completion with the chat template; that
+                    length is what its max_length truncation and its drop of
+                    fully masked rows act on.
+                    """
+                    prompts = table.column("prompt").to_pylist()
+                    completions = table.column("completion").to_pylist()
+                    out = []
+                    for i, (p, c) in enumerate(zip(prompts, completions)):
+                        ids = tok.apply_chat_template(p + c, tokenize=True)
+                        # transformers 5 returns a BatchEncoding (whose len is
+                        # its number of keys), 4.x a plain list of ids.
+                        if hasattr(ids, "keys"):
+                            ids = ids["input_ids"]
+                        n = len(ids)
+                        if n > max_length:
+                            out.append((i, n))
+                    return out
+
+
+                def drop(table, rows):
+                    gone = set(rows)
+                    return table.take([i for i in range(table.num_rows) if i not in gone])
+
+
                 src, out, source_uri = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
+                tok = AutoTokenizer.from_pretrained(sys.argv[4])
+                max_length = int(sys.argv[5])
                 (out / "data").mkdir(parents=True, exist_ok=True)
                 report = dict()
                 for split in SPLITS:
@@ -133,8 +177,20 @@ granite.build:
                         if len(bad) > MAX_DROPPED * kept.num_rows:
                             sys.exit(f"prepare: {split}: {len(bad)} of {kept.num_rows} rows "
                                      f"have a prompt not ending in a user turn (over {MAX_DROPPED:.0%})")
-                        drop = set(i for i, _ in bad)
-                        kept = kept.take([i for i in range(kept.num_rows) if i not in drop])
+                    # Source row numbers of the rows kept so far, so every drop is
+                    # recorded by its row in the source parquet.
+                    index = [i for i in range(table.num_rows) if i not in set(r for r, _ in bad)]
+                    if bad:
+                        kept = drop(kept, [r for r, _ in bad])
+                    long_rows = [(index[i], n) for i, n in too_long(kept, tok, max_length)]
+                    if long_rows:
+                        print(f"prepare: {split}: dropping {len(long_rows)} row(s) longer than "
+                              f"{max_length} tokens (longest {max(n for _, n in long_rows)})", flush=True)
+                        if len(long_rows) > MAX_TOO_LONG * kept.num_rows:
+                            sys.exit(f"prepare: {split}: {len(long_rows)} of {kept.num_rows} rows are "
+                                     f"longer than MAX_LENGTH={max_length} (over {MAX_TOO_LONG:.0%})")
+                        pos = dict((r, j) for j, r in enumerate(index))
+                        kept = drop(kept, [pos[r] for r, _ in long_rows])
                     pq.write_table(kept, out / "data" / f"{split}.parquet", compression="zstd")
                     counts = dict()
                     for c in kept.column("completion").to_pylist():
@@ -144,6 +200,8 @@ granite.build:
                         source_columns=table.column_names,
                         source_rows=table.num_rows,
                         dropped_rows=[dict(row=i, last_prompt_role=r) for i, r in bad],
+                        max_length=max_length,
+                        too_long_rows=[dict(row=i, tokens=n) for i, n in long_rows],
                         rows=kept.num_rows,
                         completion_counts=counts,
                     )
@@ -152,8 +210,10 @@ granite.build:
                     "# answerability prompt/completion (granite-4.2-8b)\n\n"
                     f"Converted from `{source_uri}` by keeping only the `prompt` and "
                     "`completion` columns (dropping the pre-tokenized `input_ids` / "
-                    "`labels` / `attention_mask`), and dropping rows whose prompt "
-                    "does not end in a user turn (`dropped_rows`, by source row).\n\n"
+                    "`labels` / `attention_mask`), dropping rows whose prompt does "
+                    "not end in a user turn (`dropped_rows`), and dropping rows longer "
+                    "than `max_length` tokens with the base model's chat template "
+                    "(`too_long_rows`). Rows are numbered by source row.\n\n"
                     "```json\n" + json.dumps(report, indent=2) + "\n```\n"
                 )
                 PY
@@ -203,7 +263,17 @@ granite.build:
                   - { env_name: CLEARML_API_SECRET_KEY, secret_name: CLEARML_API_SECRET_KEY }
 <% endif %>
             hf_peft_sft_config:
-              method: lora
+              # lora: a regular LoRA adapter. alora: an activated LoRA, which
+              # acts only from the invocation on, so serving can reuse the base
+              # model's cache for the prompt.
+              method: "$${METHOD}"
+<% if METHOD == "alora" %>
+              # The ChatML assistant marker Granite 4.2 emits before the answer
+              # turn; the last occurrence in each row opens the trained span.
+              # tojson: a JSON string is a valid YAML double-quoted scalar, so
+              # the trailing newline survives as \n instead of folding to a space.
+              alora_invocation_string: $${ALORA_INVOCATION_STRING | tojson}
+<% endif %>
               distributed: ddp
               dataset_split: "$${DATASET_SPLIT}"
               output: adapter
@@ -212,24 +282,27 @@ granite.build:
               mixed_precision: bf16
               clearml_enabled: "<% if CLEARML %>true<% else %>false<% endif %>"
               clearml_project: "$${CLEARML_PROJECT}"
-              clearml_task_name: "answerability-lora-$${RUN_ID}"
+              clearml_task_name: "answerability-$${METHOD}-$${RUN_ID}"
               lora:
-                r: 16
-                alpha: 32
+                r: $${LORA_R}
+                alpha: $${LORA_ALPHA}
                 dropout: 0.05
                 target_modules: all-linear
               # Any TRL SFTConfig field, as --<key> <value>.
               args:
-                max_length: 8192
+                # prepare already dropped longer rows, so nothing is truncated.
+                max_length: $${MAX_LENGTH}
                 per_device_train_batch_size: 1
                 gradient_accumulation_steps: 8
-                learning_rate: 5.0e-05
+                learning_rate: $${LEARNING_RATE}
                 lr_scheduler_type: cosine
                 warmup_steps: 0.05
                 weight_decay: 0.01
                 num_train_epochs: $${NUM_TRAIN_EPOCHS}
                 max_steps: $${MAX_STEPS}
-                gradient_checkpointing: true
+                # Off for aLoRA: recomputing activations loses peft's aLoRA
+                # offsets and zeroes the gradients (peft issue #2826).
+                gradient_checkpointing: <% if METHOD == "alora" %>false<% else %>true<% endif %>
                 dataloader_num_workers: 4
                 logging_steps: 10
                 seed: 0

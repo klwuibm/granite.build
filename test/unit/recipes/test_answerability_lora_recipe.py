@@ -84,15 +84,17 @@ def _run_argv(target):
     for block in ("setup", "run"):
         text = fill_template(_LAUNCHER[block], ctx, strict=True)
     for s in _SCRIPTS:
+        # NUL-separated, so an argument with a newline (the aLoRA invocation)
+        # comes back whole.
         stub = (
-            'f() { for a in "$@"; do echo "ARG:$a"; done; }; f'
+            "f() { printf 'ARG:%s\\0' \"$@\"; }; f"
             if s == "hf_peft_sft_run.sh"
             else "true"
         )
         text = text.replace(f"bash /opt/hf-peft-sft/{s}", stub)
     proc = subprocess.run(["bash", "-c", text], capture_output=True, text=True)
     assert proc.returncode == 0, proc.stderr
-    return [ln[4:] for ln in proc.stdout.splitlines() if ln.startswith("ARG:")]
+    return [a[4:] for a in proc.stdout.split("\0") if a.startswith("ARG:")]
 
 
 def _flags(argv):
@@ -213,29 +215,76 @@ def test_smoke_overrides_render(tmp_path):
 # ── prepare ──────────────────────────────────────────────────────────────────
 
 
+# A stand-in for transformers' tokenizer: one token per whitespace-separated
+# word of each message's content, plus 4 per message for the template's role
+# markers. Enough to test which rows prepare drops; the real tokenizer is the
+# base model's, staged by the hfpull.
+_FAKE_TRANSFORMERS = """
+class _Tok:
+    # Returns what transformers 5 returns: a mapping, whose len() is its number
+    # of keys, not of tokens.
+    def apply_chat_template(self, messages, tokenize=True):
+        ids = [0] * sum(4 + len(m["content"].split()) for m in messages)
+        return dict(input_ids=ids, attention_mask=[1] * len(ids))
+
+
+class AutoTokenizer:
+    @staticmethod
+    def from_pretrained(path):
+        assert path.endswith("/model"), path
+        return _Tok()
+"""
+
+
 def _prepare_script(tmp_path, src, out_root, *params):
-    """prepare's command, rendered as the command step renders it, with the
-    hf-peft-sft image's venv python swapped for this interpreter."""
+    """prepare's command, rendered as the command step renders it.
+
+    The hf-peft-sft image's venv python is swapped for this interpreter, with a
+    stub transformers first on its path. The script runs with -I, which ignores
+    PYTHONPATH, so a -c launcher inserts the stub dir and execs the heredoc.
+    """
     import sys
 
+    stub = tmp_path / "stub"
+    stub.mkdir(exist_ok=True)
+    (stub / "transformers.py").write_text(_FAKE_TRANSFORMERS)
     step = _prepare(tmp_path, f"DATA_ROOT={out_root}", *params)["steps"][0]
     command = fill_template(
         step["config"]["command_config"]["command"],
-        {"bindings": {"source": {"binding": {"path": str(src)}}}},
+        {
+            "bindings": {
+                "source": {"binding": {"path": str(src)}},
+                "base_model": {"binding": {"path": str(tmp_path / "model")}},
+            }
+        },
         strict=True,
     )
-    return command.replace("/opt/hf-peft-sft/.venv/bin/python", sys.executable)
+    launcher = (
+        "import sys; "
+        f"sys.path.insert(0, {str(stub)!r}); "
+        "sys.argv = sys.argv[1:]; "
+        "exec(compile(sys.stdin.read(), 'prepare', 'exec'), dict(__name__='__main__'))"
+    )
+    return command.replace('"$PY" -I -', f'"{sys.executable}" -I -c "{launcher}" _')
 
 
-def _source_table(n, bad=()):
+def _source_table(n, bad=(), long=()):
     """The HF source's columns: pre-tokenized ids next to prompt/completion.
 
     Rows in *bad* end their prompt with an `agent` turn, as 6 rows of the real
-    train split do.
+    train split do. Rows in *long* carry a 9,000-word document, past the
+    default MAX_LENGTH of 8192 with the stub tokenizer.
     """
+
+    def doc(i):
+        return " ".join(["word"] * 9000) if i in long else "doc"
+
     prompts = [
         [
-            {"role": "user", "content": "You have access to the following documents:"},
+            {
+                "role": "user",
+                "content": f"You have access to the following documents: {doc(i)}",
+            },
             {"role": "agent" if i in bad else "user", "content": f"q{i}?"},
         ]
         for i in range(n)
@@ -261,16 +310,16 @@ def _source_table(n, bad=()):
     )
 
 
-def _write_src(tmp_path, train_rows=6, bad=()):
+def _write_src(tmp_path, train_rows=6, bad=(), long=()):
     src = tmp_path / "src"
     src.mkdir()
-    pq.write_table(_source_table(train_rows, bad), src / "train.parquet")
+    pq.write_table(_source_table(train_rows, bad, long), src / "train.parquet")
     pq.write_table(_source_table(2), src / "test.parquet")
     return src
 
 
-def _run_prepare(tmp_path, src):
-    script = _prepare_script(tmp_path, src, tmp_path / "data", "RUN_ID=r1")
+def _run_prepare(tmp_path, src, *params):
+    script = _prepare_script(tmp_path, src, tmp_path / "data", "RUN_ID=r1", *params)
     return subprocess.run(["bash", "-c", script], capture_output=True, text=True)
 
 
@@ -324,3 +373,84 @@ def test_prepare_fails_when_too_many_rows_are_bad(tmp_path):
     assert proc.returncode != 0
     assert "2 of 50 rows" in proc.stderr
     assert "GB_ARTIFACT_ID" not in proc.stdout
+
+
+def test_prepare_binds_the_base_model_for_its_tokenizer(tmp_path):
+    inputs = _prepare(tmp_path)["inputs"]
+    assert inputs["base_model"] == _target(tmp_path)["inputs"]["base_model"]
+
+
+def test_prepare_drops_rows_longer_than_max_length(tmp_path):
+    """TRL keeps a row's start, so the label of a row past max_length is cut
+    off and TRL drops the row silently; prepare drops and records it instead."""
+    src = _write_src(tmp_path, train_rows=200, bad={3}, long={5, 17})
+    proc = _run_prepare(tmp_path, src)
+    assert proc.returncode == 0, proc.stderr
+    assert "train: dropping 2 row(s) longer than 8192 tokens" in proc.stdout
+    out = tmp_path / "data" / "r1"
+    table = pq.read_table(out / "data" / "train.parquet")
+    assert table.num_rows == 197
+    prompts = str(table.column("prompt").to_pylist())
+    for gone in ("q3?", "q5?", "q17?"):
+        assert gone not in prompts
+    readme = (out / "README.md").read_text()
+    # Numbered by source row, even after the earlier drop of row 3.
+    assert '"row": 5,' in readme and '"row": 17,' in readme
+    assert '"max_length": 8192' in readme
+
+
+def test_prepare_fails_when_max_length_drops_too_many_rows(tmp_path):
+    proc = _run_prepare(tmp_path, _write_src(tmp_path, train_rows=10, long={1, 2}))
+    assert proc.returncode != 0
+    assert "2 of 10 rows are longer than MAX_LENGTH=8192" in proc.stderr
+    assert "GB_ARTIFACT_ID" not in proc.stdout
+
+
+def test_train_max_length_follows_the_parameter(tmp_path):
+    flags = _flags(_run_argv(_target(tmp_path, "MAX_LENGTH=4096")))
+    assert flags["--max_length"] == "4096"
+
+
+# ── aLoRA ────────────────────────────────────────────────────────────────────
+
+
+def test_lora_by_default_with_gradient_checkpointing(tmp_path):
+    target = _target(tmp_path)
+    cfg = _step_config(target)["hf_peft_sft_config"]
+    assert cfg["method"] == "lora"
+    assert "alora_invocation_string" not in cfg
+    argv = _run_argv(target)
+    assert "--alora_invocation_string" not in argv
+    assert _flags(argv)["--gradient_checkpointing"] == "true"
+
+
+def test_alora_invocation_reaches_the_trainer_with_its_newline(tmp_path):
+    target = _target(tmp_path, "METHOD=alora")
+    cfg = _step_config(target)["hf_peft_sft_config"]
+    assert cfg["method"] == "alora"
+    assert cfg["alora_invocation_string"] == "<|im_start|>assistant\n"
+    argv = _run_argv(target)
+    assert argv[argv.index("--method") + 1] == "alora"
+    assert (
+        argv[argv.index("--alora_invocation_string") + 1] == "<|im_start|>assistant\n"
+    )
+
+
+def test_alora_turns_gradient_checkpointing_off(tmp_path):
+    """peft #2826: recomputation loses the aLoRA offsets and zeroes gradients."""
+    flags = _flags(_run_argv(_target(tmp_path, "METHOD=alora")))
+    assert flags["--gradient_checkpointing"] == "false"
+
+
+def test_alora_names_the_build_and_task_after_the_method(tmp_path):
+    build = _build(tmp_path, "METHOD=alora", "RUN_ID=a1")
+    assert build["name"] == "answerability-alora-a1"
+    cfg = _step_config(build["targets"]["train"])["hf_peft_sft_config"]
+    assert cfg["clearml_task_name"] == "answerability-alora-a1"
+
+
+def test_alora_hyperparameters_are_parameters(tmp_path):
+    params = ("METHOD=alora", "LORA_R=32", "LORA_ALPHA=64", "LEARNING_RATE=1e-05")
+    flags = _flags(_run_argv(_target(tmp_path, *params)))
+    got = (flags["--lora_r"], flags["--lora_alpha"], flags["--learning_rate"])
+    assert got == ("32", "64", "1e-05")
