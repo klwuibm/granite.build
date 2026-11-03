@@ -39,9 +39,13 @@ ADAPTER_ROOT: "/proj/data-eng/llmb-read-write/touma/adapters/answerability-lora"
 ACCELERATORS: "H200:4"
 MEMORY: "512"
 # prepare runs on the cpu partition in the hf-peft-sft image (its venv has
-# pyarrow). Host GiB for that job.
+# pyarrow). The partition allows at most 8 GiB per CPU, so keep
+# PREP_MEMORY <= 8 x PREP_CPUS: above that SLURM raises the CPU count and
+# SkyPilot's srun aborts ("cpus-per-task set by two different environment
+# variables").
 PREP_IMAGE: "quay.io/granitebuild/steps/train/hf-peft-sft/skypilot:peft-v0.21.2-4"
-PREP_MEMORY: "32"
+PREP_CPUS: 2
+PREP_MEMORY: "16"
 
 # ── Schedule ─────────────────────────────────────────────────────────────────
 NUM_TRAIN_EPOCHS: 3

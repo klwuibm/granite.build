@@ -49,6 +49,10 @@ granite.build:
             zone: cpu
             launcher_config:
               resources:
+                # cpu caps memory at 8 GiB per CPU (MaxMemPerCPU=8192): memory
+                # over cpus x 8 makes SLURM raise cpus-per-task, which then
+                # disagrees with SkyPilot's srun --cpus and srun aborts.
+                cpus: $${PREP_CPUS}
                 memory: "$${PREP_MEMORY}"
               sbatch_options:
                 constraint: null

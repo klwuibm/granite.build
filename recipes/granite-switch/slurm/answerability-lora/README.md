@@ -112,7 +112,7 @@ stored `labels`; `check_tokenization.py` verifies that.
 | `RUN_ID` | `it1-r1` | Names the build, the dataset dir (`$DATA_ROOT/$RUN_ID`), the adapter dir (`$ADAPTER_ROOT/$RUN_ID`) and the ClearML task. Use a new one per run: re-using one replaces that run's outputs. |
 | `SOURCE_DATA_URI` | `hf:///datasets/ibm-research/touma/main/training_data/answerability/parquet_granite4.2_8b` | The source parquet dir. The path after the revision limits the pull to it. |
 | `DATA_ROOT` | `/proj/data-eng/llmb-read-write/touma/data/answerability-lora` | Where `prepare` writes, on shared `/proj`. |
-| `PREP_IMAGE` / `PREP_MEMORY` | the hf-peft-sft image / `32` | `prepare` runs in the step image (its venv has pyarrow), so the node's image cache serves both targets. |
+| `PREP_IMAGE` / `PREP_CPUS` / `PREP_MEMORY` | the hf-peft-sft image / `2` / `16` | `prepare` runs in the step image (its venv has pyarrow), so the node's image cache serves both targets. The cpu partition allows at most 8 GiB per CPU: keep `PREP_MEMORY` ≤ 8 × `PREP_CPUS`, or SLURM raises the CPU count and SkyPilot's `srun` aborts. |
 | `BASE_MODEL_URI` | `hf:///ibm-granite/granite-4.2-8b` | Staged by an hfpull job on the cpu partition. If that job fails (it runs in a small cgroup), point this at an existing copy: `env:///proj/...`. |
 | `DATASET_SPLIT` | `train` | `load_dataset` split; `train[:256]` for a smoke run. |
 | `ADAPTER_ROOT` | `/proj/data-eng/llmb-read-write/touma/adapters/answerability-lora` | Shared, so the adapter survives teardown. |

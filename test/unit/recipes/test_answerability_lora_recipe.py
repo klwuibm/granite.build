@@ -139,7 +139,11 @@ def test_prepare_writes_to_shared_storage_on_the_cpu_partition(tmp_path):
     assert step["step_uri"] == "space://steps/command"
     assert step["config"]["zone"] == "cpu"
     assert step["config"]["launcher_config"]["sbatch_options"] == {"constraint": None}
-    assert "accelerators" not in step["config"]["launcher_config"]["resources"]
+    resources = step["config"]["launcher_config"]["resources"]
+    assert "accelerators" not in resources
+    # cpu's MaxMemPerCPU is 8 GiB: more makes SLURM raise cpus-per-task past
+    # SkyPilot's srun --cpus, and srun aborts.
+    assert int(resources["memory"]) <= 8 * int(resources["cpus"])
 
 
 def test_output_path_matches_the_output_uri(tmp_path):
