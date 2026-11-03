@@ -237,7 +237,7 @@ granite.build:
         # Written to shared /proj so it survives teardown; must match
         # hf_peft_sft_config.output_path below.
         adapter:
-          uri: "env://$${ADAPTER_ROOT}/$${RUN_ID}"
+          uri: "env://$${ADAPTER_ROOT}/answerability-$${METHOD}/$${RUN_ID}"
           type: model
       steps:
         - step_uri: space://steps/train/hf-peft-sft
@@ -277,7 +277,7 @@ granite.build:
               distributed: ddp
               dataset_split: "$${DATASET_SPLIT}"
               output: adapter
-              output_path: "$${ADAPTER_ROOT}/$${RUN_ID}"
+              output_path: "$${ADAPTER_ROOT}/answerability-$${METHOD}/$${RUN_ID}"
               base_model_id: "$${BASE_MODEL_ID}"
               mixed_precision: bf16
               clearml_enabled: "<% if CLEARML %>true<% else %>false<% endif %>"

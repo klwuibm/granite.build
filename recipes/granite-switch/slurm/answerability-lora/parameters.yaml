@@ -47,9 +47,9 @@ LORA_ALPHA: 32
 LEARNING_RATE: 5.0e-05
 
 # ── Output ───────────────────────────────────────────────────────────────────
-# Adapters land in $ADAPTER_ROOT/$RUN_ID on shared /proj (container-visible).
-# Use a different ADAPTER_ROOT (or RUN_ID) per method, so runs don't collide.
-ADAPTER_ROOT: "/proj/data-eng/llmb-read-write/touma/adapters/answerability-lora"
+# Adapters land in $ADAPTER_ROOT/answerability-$METHOD/$RUN_ID on shared /proj
+# (container-visible), so LoRA and aLoRA runs never share a directory.
+ADAPTER_ROOT: "/proj/data-eng/llmb-read-write/touma/adapters"
 
 # ── Compute ──────────────────────────────────────────────────────────────────
 # 4x H200, DDP: one bf16 copy of the 8B base per GPU.

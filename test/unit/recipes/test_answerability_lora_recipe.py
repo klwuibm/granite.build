@@ -475,3 +475,24 @@ def test_alora_hyperparameters_are_parameters(tmp_path):
     flags = _flags(_run_argv(_target(tmp_path, *params)))
     got = (flags["--lora_r"], flags["--lora_alpha"], flags["--learning_rate"])
     assert got == ("32", "64", "1e-05")
+
+
+def test_adapter_dir_follows_the_method(tmp_path):
+    """Same RUN_ID, different METHOD: the two adapters never share a dir."""
+    root = "/proj/data-eng/llmb-read-write/touma/adapters"
+    for method in ("lora", "alora"):
+        target = _target(tmp_path, f"METHOD={method}", "RUN_ID=r1")
+        cfg = _step_config(target)["hf_peft_sft_config"]
+        assert cfg["output_path"] == f"{root}/answerability-{method}/r1"
+        assert (
+            target["outputs"]["adapter"]["uri"]
+            == f"env://{root}/answerability-{method}/r1"
+        )
+
+
+def test_lora_is_the_default_method(tmp_path):
+    target = _target(tmp_path, "RUN_ID=r1")
+    cfg = _step_config(target)["hf_peft_sft_config"]
+    assert cfg["method"] == "lora"
+    # Unchanged from before METHOD existed, e.g. it1-r1's adapter.
+    assert cfg["output_path"].endswith("/adapters/answerability-lora/r1")

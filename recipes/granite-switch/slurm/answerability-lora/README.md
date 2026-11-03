@@ -128,9 +128,11 @@ support).
 
 ```bash
 gb build start -f build.yaml --param-file parameters.yaml \
-  --param METHOD=alora --param RUN_ID=<unique> \
-  --param ADAPTER_ROOT=/proj/data-eng/llmb-read-write/touma/adapters/answerability-alora
+  --param METHOD=alora --param RUN_ID=<unique>
 ```
+
+The adapter goes to `$ADAPTER_ROOT/answerability-alora/<RUN_ID>`, apart from
+the LoRA adapters in `answerability-lora/`.
 
 - **Invocation: `<|im_start|>assistant`**, Granite 4.2's ChatML assistant
   marker (tokens `[100256, 78191]`). It is the 4.2 form of the
@@ -166,17 +168,17 @@ gb build start -f build.yaml --param-file parameters.yaml \
 
 | Parameter | Default | Meaning |
 |---|---|---|
-| `RUN_ID` | `it1-r1` | Names the build, the dataset dir (`$DATA_ROOT/$RUN_ID`), the adapter dir (`$ADAPTER_ROOT/$RUN_ID`) and the ClearML task. Use a new one per run: re-using one replaces that run's outputs. |
+| `RUN_ID` | `it1-r1` | Names the build, the dataset dir (`$DATA_ROOT/$RUN_ID`), the adapter dir (`$ADAPTER_ROOT/answerability-$METHOD/$RUN_ID`) and the ClearML task. Use a new one per run: re-using one replaces that run's outputs. |
 | `SOURCE_DATA_URI` | `hf:///datasets/ibm-research/touma/main/training_data/answerability/parquet_granite4.2_8b` | The source parquet dir. The path after the revision limits the pull to it. |
 | `DATA_ROOT` | `/proj/data-eng/llmb-read-write/touma/data/answerability-lora` | Where `prepare` writes, on shared `/proj`. |
 | `PREP_IMAGE` / `PREP_CPUS` / `PREP_MEMORY` | the hf-peft-sft image / `2` / `16` | `prepare` runs in the step image (its venv has pyarrow), so the node's image cache serves both targets. The cpu partition allows at most 8 GiB per CPU: keep `PREP_MEMORY` ≤ 8 × `PREP_CPUS`, or SLURM raises the CPU count and SkyPilot's `srun` aborts. |
 | `BASE_MODEL_URI` | `hf:///ibm-granite/granite-4.2-8b` | Staged by an hfpull job on the cpu partition. If that job fails (it runs in a small cgroup), point this at an existing copy: `env:///proj/...`. |
 | `DATASET_SPLIT` | `train` | `load_dataset` split; `train[:256]` for a smoke run. |
 | `MAX_LENGTH` | `8192` | Tokens per row: `prepare` drops longer rows, and `train` uses it as `max_length`. |
-| `METHOD` | `lora` | `lora` or `alora`. Also names the build and the ClearML task. |
+| `METHOD` | `lora` | `lora` or `alora`. Also names the build, the ClearML task and the adapter subdirectory. |
 | `ALORA_INVOCATION_STRING` | `<\|im_start\|>assistant` | Only for `METHOD=alora`. A trailing newline would be dropped (see [aLoRA](#alora)). |
 | `LORA_R` / `LORA_ALPHA` / `LEARNING_RATE` | `16` / `32` / `5e-5` | Adapter rank, scale and learning rate. |
-| `ADAPTER_ROOT` | `/proj/data-eng/llmb-read-write/touma/adapters/answerability-lora` | Shared, so the adapter survives teardown. Use another one (or another `RUN_ID`) for aLoRA, so the two don't collide. |
+| `ADAPTER_ROOT` | `/proj/data-eng/llmb-read-write/touma/adapters` | Shared, so the adapter survives teardown. Each method gets its own subdirectory, `answerability-lora/` or `answerability-alora/`, so a LoRA and an aLoRA run with the same `RUN_ID` don't collide. |
 | `ACCELERATORS` | `H200:4` | DDP over 4 GPUs. Effective batch 4 × 1 × 8 = 32. |
 | `MEMORY` | `512` | Host GiB for `train`. On SLURM, gbserver drops `compute_config` memory. |
 | `NUM_TRAIN_EPOCHS` / `MAX_STEPS` | `3` / `-1` | A positive `MAX_STEPS` caps the run. |
